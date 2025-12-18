@@ -1,6 +1,8 @@
 import os
 import base64
 import time
+import re
+import threading
 from datetime import datetime
 
 import eventlet
@@ -60,18 +62,58 @@ def health():
 
 @app.get("/sessions/<session_id>/audio")
 def get_audio(session_id):
-    # Prefer in-memory playback
+    # Prefer in-memory playback if present
     sess = SESSIONS.get(session_id)
     if sess and "audio_bytes" in sess:
-        return Response(sess["audio_bytes"], mimetype=sess.get("mime", "audio/webm"))
+        data = sess["audio_bytes"]
+        mime = sess.get("mime", "audio/webm")
+    else:
+        # Fallback: find recording file starting with session_id
+        path = None
+        for fname in os.listdir(RECORDINGS_DIR):
+            if fname.startswith(session_id):
+                path = os.path.join(RECORDINGS_DIR, fname)
+                break
+        if not path:
+            return jsonify({"error": "not found"}), 404
 
-    # Fallback: find file starting with session_id
-    for fname in os.listdir(RECORDINGS_DIR):
-        if fname.startswith(session_id):
-            path = os.path.join(RECORDINGS_DIR, fname)
-            return Response(open(path, "rb").read(), mimetype="audio/webm")
+        with open(path, "rb") as f:
+            data = f.read()
+        mime = "audio/webm"
 
-    return jsonify({"error": "not found"}), 404
+    total = len(data)
+    range_header = request.headers.get("Range")
+
+    # Always advertise seeking support
+    if not range_header:
+        resp = Response(data, mimetype=mime)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Length"] = str(total)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+    if not m:
+        resp = Response(data, mimetype=mime)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Length"] = str(total)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else total - 1
+    end = min(end, total - 1)
+
+    if start >= total or start > end:
+        return Response(status=416)
+
+    chunk = data[start:end + 1]
+    resp = Response(chunk, status=206, mimetype=mime)
+    resp.headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Content-Length"] = str(end - start + 1)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # --------------------------------
@@ -190,6 +232,10 @@ def on_start_transcription(data):
         "sid": sid,
         "audio_queue": audio_queue,
         "running": True,
+
+        # NEW (do not affect existing flow)
+        "seg_seq": 0,
+        "current_segment_id": "seg_0",
     }
 
     def run_deepgram():
@@ -219,10 +265,51 @@ def on_start_transcription(data):
                     if hasattr(message, 'channel') and message.channel:
                         alternatives = message.channel.alternatives
                         if alternatives and len(alternatives) > 0:
-                            transcript = alternatives[0].transcript
+                            alt = alternatives[0]
+                            transcript = alt.transcript
+                            
                             if transcript:
                                 is_final = getattr(message, 'is_final', False)
                                 
+                                # --- NEW: word-level patch with timestamps (additive, does not replace existing events) ---
+                                segment_id = TRANSCRIPTS.get(session_id, {}).get("current_segment_id", "seg_0")
+                                dg_words = getattr(alternatives[0], "words", None) or []
+
+                                words_payload = []
+                                for idx, w in enumerate(dg_words):
+                                    text = (
+                                        getattr(w, "punctuated_word", None)
+                                        or getattr(w, "word", None)
+                                        or ""
+                                    )
+                                    t0 = getattr(w, "start", None)
+                                    t1 = getattr(w, "end", None)
+                                    conf = getattr(w, "confidence", None)
+
+                                    if text:
+                                        words_payload.append({
+                                            "wid": f"{session_id}:{segment_id}:{idx}",
+                                            "text": text,
+                                            "t0": float(t0) if t0 is not None else None,
+                                            "t1": float(t1) if t1 is not None else None,
+                                            "confidence": float(conf) if conf is not None else None,
+                                        })
+
+                                if words_payload:
+                                    patch = {
+                                        "sessionId": session_id,
+                                        "segmentId": segment_id,
+                                        "isFinal": bool(is_final),
+                                        "words": words_payload,
+                                    }
+                                    # emit inside eventlet context (same pattern you're already using)
+                                    eventlet.spawn(lambda p=patch: socketio.emit("transcript_patch", p))
+                                    print(f"[DG] WORDS: {len(words_payload)} words extracted")
+                                # --- END NEW ---
+                                
+                                # ================================
+                                # EXISTING: transcript_partial events (unchanged)
+                                # ================================
                                 if is_final:
                                     current_final = TRANSCRIPTS[session_id].get("final", "")
                                     if current_final:
@@ -238,6 +325,11 @@ def on_start_transcription(data):
                                         "transcript_partial",
                                         {"sessionId": session_id, "text": TRANSCRIPTS[session_id]["final"]},
                                     ))
+                                    
+                                    # --- NEW: advance segment after a final utterance ---
+                                    TRANSCRIPTS[session_id]["seg_seq"] += 1
+                                    TRANSCRIPTS[session_id]["current_segment_id"] = f"seg_{TRANSCRIPTS[session_id]['seg_seq']}"
+                                    # --- END NEW ---
                                 else:
                                     TRANSCRIPTS[session_id]["partial"] = transcript
                                     full_text = TRANSCRIPTS[session_id].get("final", "")
@@ -286,7 +378,7 @@ def on_start_transcription(data):
                     else:
                         eventlet.sleep(0.05)  # Use eventlet.sleep instead of time.sleep
 
-                print(f"[DG] Audio send loop ended for session {session_id}, sent {chunks_sent} total chunks")
+                    print(f"[DG] Audio send loop ended for session {session_id}, sent {chunks_sent} total chunks")
 
         except Exception as e:
             print(f"[DG] Exception in Deepgram greenlet: {e}")

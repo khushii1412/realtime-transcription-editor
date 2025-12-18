@@ -244,3 +244,17 @@
 .empty-state__text {
   font-size: 0.9375rem;
 }
+
+/* ===================================
+   WORD HIGHLIGHTING (Playback)
+   =================================== */
+.word {
+  padding: 2px 4px;
+  border-radius: 6px;
+  display: inline-block;
+}
+
+.word--active {
+  background: rgba(255, 255, 255, 0.14) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.25);
+}
