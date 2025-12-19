@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
+import FinalEditor from "./components/FinalEditor";
 import "./App.css";
 
 export default function App() {
@@ -26,6 +27,42 @@ export default function App() {
 
   // Active word during playback (for highlighting)
   const [activeWid, setActiveWid] = useState(null);
+
+  // Microphone selection
+  const [mics, setMics] = useState([]);
+  const [selectedMicId, setSelectedMicId] = useState("");
+
+  // Elapsed timer
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const timerRef = useRef(null);
+
+  // Past recordings from MongoDB
+  const [savedSessions, setSavedSessions] = useState([]);
+  const [selectedSessionId, setSelectedSessionId] = useState("");
+  const [loadingSession, setLoadingSession] = useState(false);
+
+  // Editable final transcript state (Slate format)
+  const textToSlateValue = (text) => [
+    { type: "paragraph", children: [{ text: text || "" }] },
+  ];
+  const slateToPlainText = (value) => {
+    if (!value || !Array.isArray(value)) return "";
+    return value
+      .map((node) =>
+        node.children?.map((child) => child.text || "").join("") || ""
+      )
+      .join("\n");
+  };
+  const [finalEditorValue, setFinalEditorValue] = useState(textToSlateValue(""));
+  const [isFinalDirty, setIsFinalDirty] = useState(false);
+  const isFinalDirtyRef = useRef(false);
+
+  // Track what server text was last applied to editor (for merge logic)
+  const [lastAppliedServerFinalText, setLastAppliedServerFinalText] = useState("");
+
+  // Committed final text built from segments (live updates)
+  const [committedFinalText, setCommittedFinalText] = useState("");
+  const [hasNewFinalUpdate, setHasNewFinalUpdate] = useState(false);
 
   // Log to browser console only
   const log = (msg) => {
@@ -85,6 +122,12 @@ export default function App() {
       }
       setFinalText(data.text);
       setPartialText("");
+      // Only update editor if user hasn't edited
+      if (!isFinalDirtyRef.current) {
+        setFinalEditorValue(textToSlateValue(data.text));
+      } else {
+        setHasNewFinalUpdate(true);
+      }
       log(`transcript_final: ${data.text}`);
     });
 
@@ -136,6 +179,158 @@ export default function App() {
     });
 
     return () => socket.disconnect();
+  }, []);
+
+  // Sync isFinalDirtyRef with state
+  useEffect(() => {
+    isFinalDirtyRef.current = isFinalDirty;
+  }, [isFinalDirty]);
+
+  // Enumerate microphones on mount
+  useEffect(() => {
+    const enumMics = async () => {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter((d) => d.kind === "audioinput");
+        setMics(audioInputs);
+        if (audioInputs.length > 0 && !selectedMicId) {
+          setSelectedMicId(audioInputs[0].deviceId);
+        }
+      } catch (err) {
+        console.warn("Could not enumerate mics:", err);
+      }
+    };
+    enumMics();
+    navigator.mediaDevices.addEventListener("devicechange", enumMics);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", enumMics);
+  }, [selectedMicId]);
+
+  // Timer cleanup
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
+
+  // Build committedFinalText from finalized segments (live updates during recording)
+  useEffect(() => {
+    const buildCommittedTextFromSegments = () => {
+      const sortedSegmentIds = Object.keys(segments).sort((a, b) => {
+        const numA = parseInt(a.split("_").pop() || "0", 10);
+        const numB = parseInt(b.split("_").pop() || "0", 10);
+        return numA - numB;
+      });
+
+      let text = "";
+      for (const segId of sortedSegmentIds) {
+        const seg = segments[segId];
+        if (seg && seg.isFinal && seg.words) {
+          const segText = seg.words.map((w) => w.text).join(" ");
+          text += (text ? " " : "") + segText;
+        }
+      }
+      // Clean up punctuation
+      text = text.replace(/\s+([.,!?;:])/g, "$1");
+      return text;
+    };
+
+    const newCommitted = buildCommittedTextFromSegments();
+    if (newCommitted !== committedFinalText) {
+      setCommittedFinalText(newCommitted);
+      // Update editor if not dirty
+      if (!isFinalDirty && newCommitted) {
+        setFinalEditorValue(textToSlateValue(newCommitted));
+        setLastAppliedServerFinalText(newCommitted);
+      } else if (isFinalDirty && newCommitted !== lastAppliedServerFinalText) {
+        setHasNewFinalUpdate(true);
+      }
+    }
+  }, [segments, committedFinalText, isFinalDirty, lastAppliedServerFinalText]);
+
+  // Compute if new ASR is available (for merge banner)
+  const newAsrAvailable = isFinalDirty && committedFinalText !== lastAppliedServerFinalText && committedFinalText.length > 0;
+
+  // Merge handlers
+  const handleAppendAsr = () => {
+    // Compute delta (new text since last sync)
+    const delta = committedFinalText.slice(lastAppliedServerFinalText.length).trim();
+    if (delta) {
+      // Get current editor plain text
+      const currentEditorText = slateToPlainText(finalEditorValue);
+      const newText = currentEditorText + (currentEditorText.endsWith(" ") ? "" : " ") + delta;
+      setFinalEditorValue(textToSlateValue(newText));
+    }
+    setLastAppliedServerFinalText(committedFinalText);
+    setHasNewFinalUpdate(false);
+    // Keep dirty=true (user is still in manual mode)
+  };
+
+  const handleReplaceWithAsr = () => {
+    setFinalEditorValue(textToSlateValue(committedFinalText));
+    setLastAppliedServerFinalText(committedFinalText);
+    setIsFinalDirty(false);
+    isFinalDirtyRef.current = false;
+    setHasNewFinalUpdate(false);
+  };
+
+  const handleIgnoreAsr = () => {
+    // Keep editor content unchanged, just dismiss the banner
+    setLastAppliedServerFinalText(committedFinalText);
+    setHasNewFinalUpdate(false);
+    // Keep dirty=true
+  };
+
+  // Fetch saved sessions from MongoDB
+  const fetchSessions = async () => {
+    try {
+      const res = await fetch("http://localhost:8000/api/sessions");
+      const data = await res.json();
+      setSavedSessions(data.sessions || []);
+      log(`Fetched ${data.sessions?.length || 0} sessions`);
+    } catch (err) {
+      console.warn("Could not fetch sessions:", err);
+    }
+  };
+
+  // Load a session from MongoDB
+  const loadSession = async (sid) => {
+    if (!sid) return;
+    setLoadingSession(true);
+    try {
+      const res = await fetch(`http://localhost:8000/api/sessions/${sid}`);
+      const data = await res.json();
+      if (data.session) {
+        setAudioUrl(`http://localhost:8000/sessions/${sid}/audio`);
+        setFinalText(data.finalText || data.session.finalText || "");
+        setCommittedFinalText(data.finalText || data.session.finalText || "");
+        setFinalEditorValue(textToSlateValue(data.finalText || data.session.finalText || ""));
+        setIsFinalDirty(false);
+
+        // Load segments from response (returned inline)
+        if (data.segments) {
+          const allWords = [];
+          for (const seg of data.segments) {
+            if (seg.words) {
+              for (const w of seg.words) {
+                allWords.push({ ...w, isFinal: seg.isFinal !== false });
+              }
+            }
+          }
+          setWords(allWords);
+        }
+        log(`Loaded session ${sid}`);
+      }
+    } catch (err) {
+      console.warn("Could not load session:", err);
+    } finally {
+      setLoadingSession(false);
+    }
+  };
+
+  // Fetch sessions on mount
+  useEffect(() => {
+    fetchSessions();
   }, []);
 
   // ---------------------------
@@ -224,13 +419,31 @@ export default function App() {
       sessionIdRef.current = `sess_${Date.now()}`;
       seqRef.current = 0;
 
+      // Reset all states
       setAudioUrl(null);
       setPartialText("");
       setFinalText("");
-      setWords([]); // Reset word-level data
-      setSegments({}); // Reset segments data
-      // getting audio stream
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setCommittedFinalText("");
+      setFinalEditorValue(textToSlateValue(""));
+      setIsFinalDirty(false);
+      setHasNewFinalUpdate(false);
+      setLastAppliedServerFinalText("");
+      isFinalDirtyRef.current = false;
+      setWords([]);
+      setSegments({});
+      setElapsedMs(0);
+
+      // Start timer
+      const startTime = Date.now();
+      timerRef.current = setInterval(() => {
+        setElapsedMs(Date.now() - startTime);
+      }, 100);
+
+      // Get audio stream with selected mic
+      const constraints = selectedMicId
+        ? { audio: { deviceId: { exact: selectedMicId } } }
+        : { audio: true };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
 
       const options = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -283,6 +496,12 @@ export default function App() {
   const stopRecording = () => {
     const sessionId = sessionIdRef.current;
     if (!sessionId) return;
+
+    // Stop timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
 
     const mr = mediaRecorderRef.current;
 
@@ -419,6 +638,93 @@ export default function App() {
         </div>
       </div>
 
+      {/* Past Recordings + Mic Selection */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 16, justifyContent: "center" }}>
+        <button
+          onClick={fetchSessions}
+          disabled={recStatus === "recording" || loadingSession}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 6,
+            border: "1px solid rgba(255,255,255,0.2)",
+            background: "var(--surface-primary)",
+            color: "var(--text-primary)",
+            cursor: recStatus === "recording" || loadingSession ? "not-allowed" : "pointer",
+            fontSize: 13,
+            opacity: recStatus === "recording" || loadingSession ? 0.5 : 1,
+          }}
+        >
+          Refresh Sessions
+        </button>
+        <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+          Past Recordings:
+          <select
+            value={selectedSessionId}
+            onChange={(e) => {
+              const sid = e.target.value;
+              setSelectedSessionId(sid);
+              loadSession(sid);
+            }}
+            disabled={recStatus === "recording" || loadingSession}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 6,
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "var(--surface-primary)",
+              color: "var(--text-primary)",
+              cursor: recStatus === "recording" || loadingSession ? "not-allowed" : "pointer",
+              minWidth: 180,
+              opacity: recStatus === "recording" || loadingSession ? 0.5 : 1,
+            }}
+          >
+            <option value="">-- select --</option>
+            {savedSessions.map((s) => (
+              <option key={s.sessionId} value={s.sessionId}>
+                {s.sessionId} ({s.status || "saved"})
+              </option>
+            ))}
+          </select>
+        </label>
+        {loadingSession && <span style={{ fontSize: 12, opacity: 0.7 }}>Loading...</span>}
+      </div>
+
+      {/* Mic Selection + Timer */}
+      <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 16, justifyContent: "center" }}>
+        <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+          Microphone:
+          <select
+            value={selectedMicId}
+            onChange={(e) => setSelectedMicId(e.target.value)}
+            disabled={recStatus === "recording"}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 6,
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "var(--surface-primary)",
+              color: "var(--text-primary)",
+              cursor: recStatus === "recording" ? "not-allowed" : "pointer",
+            }}
+          >
+            {mics.length === 0 && <option value="">No mics found</option>}
+            {mics.map((m) => (
+              <option key={m.deviceId} value={m.deviceId}>
+                {m.label || `Microphone (${m.deviceId.slice(0, 6)}...)`}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div style={{
+          fontSize: 14,
+          fontFamily: "monospace",
+          padding: "6px 12px",
+          borderRadius: 6,
+          background: recStatus === "recording" ? "rgba(239,68,68,0.15)" : "var(--surface-primary)",
+          border: recStatus === "recording" ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.1)",
+        }}>
+          {Math.floor(elapsedMs / 60000)}:{String(Math.floor((elapsedMs % 60000) / 1000)).padStart(2, "0")}
+        </div>
+      </div>
+
       {/* Controls */}
       <div className="controls">
         <button
@@ -440,37 +746,25 @@ export default function App() {
           </svg>
           Start Recording
         </button>
-
         <button
           className="btn-danger"
           onClick={stopRecording}
           disabled={recStatus !== "recording"}
         >
-          <svg
-            viewBox="0 0 24 24"
-            fill="currentColor"
-          >
+          <svg viewBox="0 0 24 24" fill="currentColor">
             <rect x="6" y="6" width="12" height="12" rx="2" />
           </svg>
           Stop
         </button>
       </div>
 
-      {/* Transcript Card */}
+      {/* Interim Transcript Box (Read-Only) */}
       <div className="card">
         <div className="card__header">
-          <svg
-            className="card__icon"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
+          <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
           </svg>
-          <span className="card__title">Live Transcript</span>
+          <span className="card__title">Interim (Live)</span>
           {recStatus === "recording" && (
             <span className="live-indicator">
               <span className="live-indicator__dot" />
@@ -478,21 +772,112 @@ export default function App() {
             </span>
           )}
         </div>
-        <div className="transcript">
-          {!partialText && !finalText ? (
-            <p className="transcript__placeholder">
-              Start recording to see live transcription...
+        <div className="transcript" style={{ minHeight: 80 }}>
+          {!partialText ? (
+            <p className="transcript__placeholder" style={{ opacity: 0.5, fontStyle: "italic" }}>
+              {recStatus === "recording" ? "Listening..." : "Start recording to see live transcription..."}
             </p>
           ) : (
             <div className="transcript__content">
-              {partialText && (
-                <span className="transcript__partial">{partialText}</span>
-              )}
-              {finalText && (
-                <div className="transcript__final">
-                  <strong>Final:</strong> {finalText}
-                </div>
-              )}
+              <span className="transcript__partial">{partialText}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Final Transcript Box (Rich Text Editor) */}
+      <div className="card">
+        <div className="card__header">
+          <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+          </svg>
+          <span className="card__title">Final (Rich Text Editor)</span>
+        </div>
+        <div style={{ padding: "0 1rem 1rem 1rem" }}>
+          <FinalEditor
+            value={finalEditorValue}
+            onChange={(val) => setFinalEditorValue(val)}
+            onUserEdit={() => {
+              setIsFinalDirty(true);
+              isFinalDirtyRef.current = true;
+            }}
+            onResetToLatest={() => {
+              setFinalEditorValue(textToSlateValue(committedFinalText));
+              setIsFinalDirty(false);
+              setHasNewFinalUpdate(false);
+              isFinalDirtyRef.current = false;
+            }}
+            showNewFinalBadge={hasNewFinalUpdate}
+            isFinalDirty={isFinalDirty}
+          />
+          {/* Merge Options Banner */}
+          {newAsrAvailable && (
+            <div style={{
+              marginTop: 12,
+              padding: 12,
+              borderRadius: 8,
+              background: "rgba(16, 185, 129, 0.1)",
+              border: "1px solid rgba(16, 185, 129, 0.3)",
+            }}>
+              <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 8 }}>
+                New ASR update available. Your edits are preserved.
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  onClick={handleAppendAsr}
+                  style={{
+                    padding: "6px 14px",
+                    borderRadius: 6,
+                    border: "1px solid rgba(16, 185, 129, 0.4)",
+                    background: "rgba(16, 185, 129, 0.2)",
+                    color: "#10b981",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontWeight: 500,
+                  }}
+                >
+                  Append new ASR
+                </button>
+                <button
+                  onClick={handleReplaceWithAsr}
+                  style={{
+                    padding: "6px 14px",
+                    borderRadius: 6,
+                    border: "1px solid rgba(139, 92, 246, 0.4)",
+                    background: "rgba(139, 92, 246, 0.15)",
+                    color: "var(--text-primary)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontWeight: 500,
+                  }}
+                >
+                  Replace with ASR
+                </button>
+                <button
+                  onClick={handleIgnoreAsr}
+                  style={{
+                    padding: "6px 14px",
+                    borderRadius: 6,
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    background: "transparent",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  Ignore
+                </button>
+              </div>
+              <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)", opacity: 0.8 }}>
+                Latest from ASR: {committedFinalText.slice(0, 80)}{committedFinalText.length > 80 ? "..." : ""}
+              </div>
+            </div>
+          )}
+          {/* Show info when dirty but no new ASR */}
+          {isFinalDirty && !newAsrAvailable && committedFinalText && (
+            <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-muted)", opacity: 0.7 }}>
+              Synced with ASR.
             </div>
           )}
         </div>
