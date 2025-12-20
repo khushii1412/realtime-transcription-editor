@@ -83,8 +83,31 @@ def register_routes(app):
                 "segments": segs,
                 # Convenience fields (frontend friendly)
                 "finalText": sess.get("finalText", ""),
+                "slateContent": sess.get("slateContent"),  # Slate JSON for rich text formatting
+                "durationMs": sess.get("durationMs"),  # Recording duration in milliseconds
                 "audioPath": sess.get("audioPath"),
                 "mime": sess.get("mime", "audio/webm"),
             })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.put("/api/sessions/<session_id>/content")
+    def api_save_session_content(session_id):
+        """Save formatted content (Slate JSON) and duration for a session."""
+        from mongo_adapter import upsert_session
+        try:
+            data = request.get_json()
+            slate_content = data.get("slateContent")
+            final_text = data.get("finalText", "")
+            duration_ms = data.get("durationMs")
+            
+            if slate_content is not None:
+                update_fields = {"slateContent": slate_content, "finalText": final_text}
+                if duration_ms is not None:
+                    update_fields["durationMs"] = duration_ms
+                upsert_session(session_id, **update_fields)
+                return jsonify({"ok": True})
+            else:
+                return jsonify({"error": "slateContent required"}), 400
         except Exception as e:
             return jsonify({"error": str(e)}), 500

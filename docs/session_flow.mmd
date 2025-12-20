@@ -1,0 +1,73 @@
+sequenceDiagram
+    participant U as User
+    participant FE as Frontend
+    participant LS as LocalStorage
+    participant BE as Backend
+    participant DG as Deepgram
+    participant DB as MongoDB
+
+    U->>FE: Opens App
+    FE->>LS: Check for lastSessionId
+    alt Has lastSessionId
+        LS-->>FE: Return sess_xxx
+        FE->>BE: GET /api/sessions/sess_xxx
+        BE->>DB: Query session + segments
+        DB-->>BE: Session data
+        BE-->>FE: session, segments, finalText
+        FE->>FE: Populate transcript, words, audio URL
+        FE->>FE: Set currentSessionId
+    else No lastSessionId
+        FE->>FE: Show No session state
+    end
+
+    U->>FE: Clicks New Session button
+    FE->>FE: Clear all state
+    FE->>FE: sessionIdRef = null
+    FE->>FE: Show No session
+
+    U->>FE: Clicks Start Recording
+    alt No sessionId exists
+        FE->>FE: Generate sessionId = sess_timestamp
+        FE->>FE: Set currentSessionId
+    else sessionId already exists
+        FE->>FE: Continue with existing sessionId
+    end
+    FE->>LS: Save lastSessionId
+    FE->>FE: Reset content state
+    FE->>FE: Start timer
+    FE->>FE: Get microphone stream
+    FE->>BE: emit start_transcription with sessionId
+    BE->>DB: upsert_session status recording
+    BE->>DG: Open WebSocket connection
+    BE-->>FE: Ready to receive audio
+    FE->>FE: Start MediaRecorder 250ms chunks
+
+    loop Every 250ms
+        FE->>BE: emit audio_chunk with sessionId seq bytes
+        BE->>BE: Queue audio for Deepgram
+        BE->>DG: Send audio bytes
+        DG-->>BE: transcript_patch words timestamps
+        BE-->>FE: emit transcript_patch sessionId words
+        FE->>FE: Update segments and words state
+    end
+
+    U->>FE: Clicks Stop
+    FE->>FE: Stop MediaRecorder
+    FE->>FE: Stop timer
+    FE->>BE: emit stop_recording with sessionId
+    BE->>DB: upsert_session status stopped audioPath
+    BE-->>FE: emit recording_saved sessionId size
+    FE->>BE: emit finalize_transcription with sessionId
+    BE->>DG: Close connection
+    BE->>DB: upsert_session status finalized finalText
+    BE-->>FE: emit transcript_final sessionId text
+    FE->>FE: Update editor with final text
+
+    U->>FE: Selects from Load dropdown
+    FE->>BE: GET /api/sessions/sess_xxx
+    BE->>DB: Query session + segments
+    DB-->>BE: Session data
+    BE-->>FE: session segments finalText
+    FE->>FE: Populate all state
+    FE->>LS: Update lastSessionId
+    FE->>FE: Set currentSessionId

@@ -41,6 +41,11 @@ export default function App() {
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [loadingSession, setLoadingSession] = useState(false);
 
+  // Current active session tracking
+  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [isNewSession, setIsNewSession] = useState(false);
+  const [currentSessionStatus, setCurrentSessionStatus] = useState(null); // null, "recording", "stopped", "finalized"
+
   // Editable final transcript state (Slate format)
   const textToSlateValue = (text) => [
     { type: "paragraph", children: [{ text: text || "" }] },
@@ -62,7 +67,23 @@ export default function App() {
 
   // Committed final text built from segments (live updates)
   const [committedFinalText, setCommittedFinalText] = useState("");
+  const committedFinalTextRef = useRef("");
   const [hasNewFinalUpdate, setHasNewFinalUpdate] = useState(false);
+
+  // Theme toggle (light/dark)
+  const [theme, setTheme] = useState(() => {
+    return localStorage.getItem("theme") || "dark";
+  });
+
+  // Apply theme to document
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  };
 
   // Log to browser console only
   const log = (msg) => {
@@ -89,8 +110,8 @@ export default function App() {
       log("Disconnected");
     });
 
-    socket.on("audio_ack", (data) => {
-      log(`audio_ack seq=${data.seq}`);
+    socket.on("audio_ack", () => {
+      // Silently acknowledge
     });
 
     socket.on("recording_saved", (data) => {
@@ -105,35 +126,46 @@ export default function App() {
     });
 
     socket.on("transcript_partial", (data) => {
-      console.log("[SOCKET] transcript_partial received:", data);
       if (data.sessionId !== sessionIdRef.current) {
-        console.log("[SOCKET] Ignoring - wrong sessionId. Expected:", sessionIdRef.current, "Got:", data.sessionId);
         return;
       }
-      setPartialText(data.text);
+      // Only show the NEW portion that's not yet finalized
+      // (partial text from Deepgram includes everything, so we subtract what's already in final)
+      const fullPartial = data.text || "";
+      const alreadyFinal = committedFinalTextRef.current || "";
+
+      // If partial starts with what's already final, show only the tail
+      if (fullPartial.startsWith(alreadyFinal)) {
+        const newPortion = fullPartial.slice(alreadyFinal.length).trim();
+        setPartialText(newPortion);
+      } else {
+        // Fallback: show full partial if it doesn't match
+        setPartialText(fullPartial);
+      }
       log(`transcript_partial: ${data.text}`);
     });
 
     socket.on("transcript_final", (data) => {
-      console.log("[SOCKET] transcript_final received:", data);
       if (data.sessionId !== sessionIdRef.current) {
-        console.log("[SOCKET] Ignoring - wrong sessionId. Expected:", sessionIdRef.current, "Got:", data.sessionId);
         return;
       }
       setFinalText(data.text);
       setPartialText("");
-      // Only update editor if user hasn't edited
-      if (!isFinalDirtyRef.current) {
-        setFinalEditorValue(textToSlateValue(data.text));
-      } else {
-        setHasNewFinalUpdate(true);
-      }
+      // Note: We don't update finalEditorValue here because segment-based updates 
+      // already handle this and preserve user edits
       log(`transcript_final: ${data.text}`);
+
+      // Auto-refresh session list after finalization (with small delay for DB write)
+      setTimeout(() => {
+        fetch("http://localhost:8000/sessions")
+          .then((r) => r.json())
+          .then((list) => setSavedSessions(list || []))
+          .catch(() => { });
+      }, 500);
     });
 
     // NEW: Listen for word-level transcript patches
     socket.on("transcript_patch", (data) => {
-      console.log("[SOCKET] transcript_patch received:", data);
       if (data.sessionId !== sessionIdRef.current) {
         return;
       }
@@ -166,6 +198,11 @@ export default function App() {
         }
       });
 
+      // Clear partial text when segment is finalized (it's now in final editor)
+      if (data.isFinal) {
+        setPartialText("");
+      }
+
       log(`transcript_patch: ${data.words.length} words (isFinal=${data.isFinal})`);
     });
 
@@ -173,10 +210,10 @@ export default function App() {
       log(`connect_error: ${e.message}`);
     });
 
-    // Debug: catch all events
-    socket.onAny((eventName, ...args) => {
-      console.log("[SOCKET] Event:", eventName, args);
-    });
+    // Debug: catch all events (disabled for cleaner console)
+    // socket.onAny((eventName, ...args) => {
+    //   console.log("[SOCKET] Event:", eventName, args);
+    // });
 
     return () => socket.disconnect();
   }, []);
@@ -214,6 +251,8 @@ export default function App() {
   }, []);
 
   // Build committedFinalText from finalized segments (live updates during recording)
+  // AUTO-APPEND: New transcription text is ALWAYS appended to the current editor content
+  // This preserves user edits while still adding new transcription at the end
   useEffect(() => {
     const buildCommittedTextFromSegments = () => {
       const sortedSegmentIds = Object.keys(segments).sort((a, b) => {
@@ -236,50 +275,30 @@ export default function App() {
     };
 
     const newCommitted = buildCommittedTextFromSegments();
+
+    // Only proceed if there's new ASR content
     if (newCommitted !== committedFinalText) {
+      const oldCommitted = committedFinalText;
       setCommittedFinalText(newCommitted);
-      // Update editor if not dirty
-      if (!isFinalDirty && newCommitted) {
+      committedFinalTextRef.current = newCommitted;
+
+      // Calculate the NEW portion of text (delta) that was just transcribed
+      if (newCommitted.length > oldCommitted.length) {
+        const delta = newCommitted.slice(oldCommitted.length).trim();
+        if (delta) {
+          // ALWAYS APPEND to current editor content (preserves user edits)
+          const currentEditorText = slateToPlainText(finalEditorValue);
+          const separator = currentEditorText && !currentEditorText.endsWith(" ") ? " " : "";
+          const newText = currentEditorText + separator + delta;
+          setFinalEditorValue(textToSlateValue(newText));
+        }
+      } else if (oldCommitted === "" && newCommitted) {
+        // First segment - initialize editor
         setFinalEditorValue(textToSlateValue(newCommitted));
-        setLastAppliedServerFinalText(newCommitted);
-      } else if (isFinalDirty && newCommitted !== lastAppliedServerFinalText) {
-        setHasNewFinalUpdate(true);
       }
+      // If newCommitted is shorter (shouldn't happen normally), don't update editor
     }
-  }, [segments, committedFinalText, isFinalDirty, lastAppliedServerFinalText]);
-
-  // Compute if new ASR is available (for merge banner)
-  const newAsrAvailable = isFinalDirty && committedFinalText !== lastAppliedServerFinalText && committedFinalText.length > 0;
-
-  // Merge handlers
-  const handleAppendAsr = () => {
-    // Compute delta (new text since last sync)
-    const delta = committedFinalText.slice(lastAppliedServerFinalText.length).trim();
-    if (delta) {
-      // Get current editor plain text
-      const currentEditorText = slateToPlainText(finalEditorValue);
-      const newText = currentEditorText + (currentEditorText.endsWith(" ") ? "" : " ") + delta;
-      setFinalEditorValue(textToSlateValue(newText));
-    }
-    setLastAppliedServerFinalText(committedFinalText);
-    setHasNewFinalUpdate(false);
-    // Keep dirty=true (user is still in manual mode)
-  };
-
-  const handleReplaceWithAsr = () => {
-    setFinalEditorValue(textToSlateValue(committedFinalText));
-    setLastAppliedServerFinalText(committedFinalText);
-    setIsFinalDirty(false);
-    isFinalDirtyRef.current = false;
-    setHasNewFinalUpdate(false);
-  };
-
-  const handleIgnoreAsr = () => {
-    // Keep editor content unchanged, just dismiss the banner
-    setLastAppliedServerFinalText(committedFinalText);
-    setHasNewFinalUpdate(false);
-    // Keep dirty=true
-  };
+  }, [segments, committedFinalText, finalEditorValue]);
 
   // Fetch saved sessions from MongoDB
   const fetchSessions = async () => {
@@ -301,25 +320,46 @@ export default function App() {
       const res = await fetch(`http://localhost:8000/api/sessions/${sid}`);
       const data = await res.json();
       if (data.session) {
+        // Save to localStorage for next app open
+        localStorage.setItem("lastSessionId", sid);
+        setCurrentSessionId(sid);
+        sessionIdRef.current = sid;
+        setIsNewSession(false);
+        setCurrentSessionStatus(data.session.status || "finalized"); // Set status from loaded session
+
         setAudioUrl(`http://localhost:8000/sessions/${sid}/audio`);
         setFinalText(data.finalText || data.session.finalText || "");
         setCommittedFinalText(data.finalText || data.session.finalText || "");
-        setFinalEditorValue(textToSlateValue(data.finalText || data.session.finalText || ""));
+
+        // Load Slate content with formatting if available, otherwise use plain text
+        if (data.slateContent && Array.isArray(data.slateContent)) {
+          setFinalEditorValue(data.slateContent);
+        } else {
+          setFinalEditorValue(textToSlateValue(data.finalText || data.session.finalText || ""));
+        }
         setIsFinalDirty(false);
+
+        // Load recording duration if available
+        if (data.durationMs) {
+          setElapsedMs(data.durationMs);
+        }
 
         // Load segments from response (returned inline)
         if (data.segments) {
           const allWords = [];
+          const loadedSegments = {};
           for (const seg of data.segments) {
             if (seg.words) {
+              loadedSegments[seg.segmentId] = { words: seg.words, isFinal: seg.isFinal !== false };
               for (const w of seg.words) {
                 allWords.push({ ...w, isFinal: seg.isFinal !== false });
               }
             }
           }
           setWords(allWords);
+          setSegments(loadedSegments);
         }
-        log(`Loaded session ${sid}`);
+        log(`Loaded session ${sid} (status: ${data.session.status || "finalized"}, duration: ${data.durationMs ? Math.floor(data.durationMs / 1000) + 's' : 'unknown'})`);
       }
     } catch (err) {
       console.warn("Could not load session:", err);
@@ -328,10 +368,77 @@ export default function App() {
     }
   };
 
-  // Fetch sessions on mount
+  // Fetch sessions on mount and auto-load last session
   useEffect(() => {
-    fetchSessions();
+    const initializeSession = async () => {
+      // First fetch all sessions
+      await fetchSessions();
+
+      // Then try to load the last session from localStorage
+      const lastSid = localStorage.getItem("lastSessionId");
+      if (lastSid) {
+        log(`Auto-loading last session: ${lastSid}`);
+        await loadSession(lastSid);
+        setSelectedSessionId(lastSid);
+      }
+    };
+    initializeSession();
   }, []);
+
+  // Create a new session (clears all state, waits for recording to start)
+  const createNewSession = () => {
+    // Clear session references
+    sessionIdRef.current = null;
+    setCurrentSessionId(null);
+    setIsNewSession(true);
+    setCurrentSessionStatus(null); // Allow recording on new session
+
+    // Clear localStorage so refresh doesn't load old session
+    localStorage.removeItem("lastSessionId");
+
+    // Clear all content state
+    setAudioUrl(null);
+    setPartialText("");
+    setFinalText("");
+    setCommittedFinalText("");
+    committedFinalTextRef.current = "";
+    setFinalEditorValue(textToSlateValue(""));
+    setIsFinalDirty(false);
+    setHasNewFinalUpdate(false);
+    setLastAppliedServerFinalText("");
+    isFinalDirtyRef.current = false;
+    setWords([]);
+    setSegments({});
+    setElapsedMs(0);
+    setSelectedSessionId("");
+
+    log("New session created (waiting for recording to start)");
+  };
+
+  // Save Slate content (with formatting) and duration to database
+  const saveSlateContent = async (durationMs = null) => {
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+
+    try {
+      const plainText = slateToPlainText(finalEditorValue);
+      const body = {
+        slateContent: finalEditorValue,
+        finalText: plainText,
+      };
+      if (durationMs !== null) {
+        body.durationMs = durationMs;
+      }
+      await fetch(`http://localhost:8000/api/sessions/${sessionId}/content`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      log("Saved formatted content to database");
+    } catch (err) {
+      console.warn("Failed to save slate content:", err);
+    }
+  };
 
   // ---------------------------
   // Helpers
@@ -416,10 +523,21 @@ export default function App() {
         return;
       }
 
-      sessionIdRef.current = `sess_${Date.now()}`;
+      // Generate new session ID ONLY if we don't have one
+      // Include random suffix to ensure uniqueness across concurrent users
+      if (!sessionIdRef.current) {
+        const randomSuffix = Math.random().toString(36).substring(2, 8);
+        sessionIdRef.current = `sess_${Date.now()}_${randomSuffix}`;
+        setCurrentSessionId(sessionIdRef.current);
+        log(`Generated new session ID: ${sessionIdRef.current}`);
+      }
+
+      // Save to localStorage immediately when recording starts
+      localStorage.setItem("lastSessionId", sessionIdRef.current);
+
       seqRef.current = 0;
 
-      // Reset all states
+      // Reset content states for new recording
       setAudioUrl(null);
       setPartialText("");
       setFinalText("");
@@ -432,6 +550,7 @@ export default function App() {
       setWords([]);
       setSegments({});
       setElapsedMs(0);
+      setIsNewSession(false);
 
       // Start timer
       const startTime = Date.now();
@@ -465,11 +584,9 @@ export default function App() {
           mime: evt.data.type,
           bytes: toBase64(buf),
         });
-
-        log(`sent chunk seq=${seq} size=${evt.data.size}`);
       };
 
-      // FIX #2: Start transcription FIRST (before MediaRecorder)
+      // Start transcription FIRST (before MediaRecorder)
       // So Deepgram receives chunk 0 with the WebM header
       socketRef.current.emit("start_transcription", {
         sessionId: sessionIdRef.current,
@@ -532,7 +649,27 @@ export default function App() {
 
     mediaRecorderRef.current = null;
     setRecStatus("idle");
-    log("Recording stopped");
+    setCurrentSessionStatus("finalized"); // Mark session as finalized
+    setSelectedSessionId(sessionIdRef.current); // Select the current session in dropdown
+
+    // Capture duration before resetting
+    const recordingDurationMs = elapsedMs;
+
+    // Save formatted content and duration to database (with small delay for transcript to finalize)
+    // Then refresh session list to show the new session
+    setTimeout(async () => {
+      await saveSlateContent(recordingDurationMs);
+      // Refresh session list to show the newly saved session
+      try {
+        const res = await fetch("http://localhost:8000/api/sessions");
+        const data = await res.json();
+        setSavedSessions(data.sessions || []);
+      } catch (err) {
+        console.warn("Failed to refresh sessions:", err);
+      }
+    }, 1000);
+
+    log(`Recording stopped (duration: ${Math.floor(recordingDurationMs / 1000)}s)`);
   };
 
   // ---------------------------
@@ -602,7 +739,7 @@ export default function App() {
   // ---------------------------
   return (
     <div className="app">
-      {/* Header */}
+      {/* Header - spans all columns */}
       <header className="header">
         <h1 className="header__title">Live Transcription Studio</h1>
         <p className="header__subtitle">
@@ -610,383 +747,260 @@ export default function App() {
         </p>
       </header>
 
-      {/* Status Bar */}
-      <div className="status-bar">
-        <div className="status-item">
-          <span className="status-item__label">Server</span>
-          <span className="status-item__value">
-            <span
-              className={`status-dot ${status === "connected"
-                ? "status-dot--connected"
-                : "status-dot--disconnected"
-                }`}
-            />
-            {status}
-          </span>
+      {/* ========== LEFT SIDEBAR - Session Controls ========== */}
+      <aside className="sidebar sidebar-left">
+        {/* Current Session */}
+        <div className="sidebar-section">
+          <div className="sidebar-section__title">Current Session</div>
+          <div className={`session-display ${!currentSessionId ? 'session-display--empty' : ''}`}>
+            <span className={`session-display__id ${!currentSessionId ? 'session-display__id--empty' : ''}`}>
+              {currentSessionId || "(No session)"}
+            </span>
+          </div>
+          <button
+            className="btn-new-session"
+            onClick={createNewSession}
+            disabled={recStatus === "recording"}
+          >
+            <span>+</span> New Session
+          </button>
         </div>
-        <div className="status-item">
-          <span className="status-item__label">Recorder</span>
-          <span className="status-item__value">
-            <span
-              className={`status-dot ${recStatus === "recording"
-                ? "status-dot--recording"
-                : "status-dot--idle"
-                }`}
-            />
-            {recStatus}
-          </span>
-        </div>
-      </div>
 
-      {/* Past Recordings + Mic Selection */}
-      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 16, justifyContent: "center" }}>
-        <button
-          onClick={fetchSessions}
-          disabled={recStatus === "recording" || loadingSession}
-          style={{
-            padding: "6px 12px",
-            borderRadius: 6,
-            border: "1px solid rgba(255,255,255,0.2)",
-            background: "var(--surface-primary)",
-            color: "var(--text-primary)",
-            cursor: recStatus === "recording" || loadingSession ? "not-allowed" : "pointer",
-            fontSize: 13,
-            opacity: recStatus === "recording" || loadingSession ? 0.5 : 1,
-          }}
-        >
-          Refresh Sessions
-        </button>
-        <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-          Past Recordings:
+        {/* Past Sessions */}
+        <div className="sidebar-section">
+          <div className="sidebar-section__title">Load Session</div>
           <select
+            className="session-select"
             value={selectedSessionId}
             onChange={(e) => {
               const sid = e.target.value;
+              if (sid === "__new__") {
+                createNewSession();
+                return;
+              }
               setSelectedSessionId(sid);
               loadSession(sid);
             }}
             disabled={recStatus === "recording" || loadingSession}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 6,
-              border: "1px solid rgba(255,255,255,0.2)",
-              background: "var(--surface-primary)",
-              color: "var(--text-primary)",
-              cursor: recStatus === "recording" || loadingSession ? "not-allowed" : "pointer",
-              minWidth: 180,
-              opacity: recStatus === "recording" || loadingSession ? 0.5 : 1,
-            }}
           >
-            <option value="">-- select --</option>
+            {isNewSession && !currentSessionId ? (
+              <option value="">Current Session (new)</option>
+            ) : (
+              <option value="">-- select --</option>
+            )}
             {savedSessions.map((s) => (
               <option key={s.sessionId} value={s.sessionId}>
-                {s.sessionId} ({s.status || "saved"})
+                {s.sessionId.replace('sess_', '')} ({s.status || "saved"})
               </option>
             ))}
           </select>
-        </label>
-        {loadingSession && <span style={{ fontSize: 12, opacity: 0.7 }}>Loading...</span>}
-      </div>
+        </div>
+      </aside>
 
-      {/* Mic Selection + Timer */}
-      <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 16, justifyContent: "center" }}>
-        <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-          Microphone:
+      {/* ========== MAIN CONTENT - Transcripts ========== */}
+      <main className="main-content">
+        {/* Final Transcript Box (Rich Text Editor) - ON TOP */}
+        <div className="card card--final">
+          <div className="card__header">
+            <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+            <span className="card__title">Final (Rich Text Editor)</span>
+            {/* Theme Toggle - Right Side */}
+            <button
+              onClick={toggleTheme}
+              style={{
+                marginLeft: "auto",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "4px 10px",
+                borderRadius: 16,
+                border: "1px solid var(--border-default)",
+                background: "var(--surface-secondary)",
+                color: "var(--text-secondary)",
+                fontSize: 11,
+                cursor: "pointer",
+                transition: "all 0.2s ease",
+              }}
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            >
+              {theme === "dark" ? (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="12" cy="12" r="5" />
+                    <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+                  </svg>
+                  Light
+                </>
+              ) : (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                  </svg>
+                  Dark
+                </>
+              )}
+            </button>
+          </div>
+          <div style={{ padding: "0 0.5rem" }}>
+            <FinalEditor
+              value={finalEditorValue}
+              onChange={(val) => setFinalEditorValue(val)}
+            />
+          </div>
+        </div>
+
+        {/* Interim Transcript Box (Read-Only) - BELOW */}
+        <div className="card card--interim">
+          <div className="card__header">
+            <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            <span className="card__title">Interim (Live)</span>
+            {recStatus === "recording" && (
+              <span className="live-indicator">
+                <span className="live-indicator__dot" />
+                Live
+              </span>
+            )}
+          </div>
+          <div className="transcript">
+            {!partialText ? (
+              <p className="transcript__placeholder">
+                {recStatus === "recording" ? "Listening..." : "Start recording to see live transcription..."}
+              </p>
+            ) : (
+              <div className="transcript__content">
+                <span className="transcript__partial">{partialText}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Audio Playback */}
+        {audioUrl && (
+          <div className="card audio-section">
+            <div className="card__header">
+              <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              <span className="card__title">Playback</span>
+              {elapsedMs > 0 && (
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                  {Math.floor(elapsedMs / 60000)}:{String(Math.floor((elapsedMs % 60000) / 1000)).padStart(2, "0")}
+                </span>
+              )}
+            </div>
+            <audio ref={audioRef} controls src={audioUrl} className="audio-player" />
+          </div>
+        )}
+
+        {/* Clickable Word Spans */}
+        {words.length > 0 && (
+          <div className="card">
+            <div className="card__header">
+              <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="4 7 4 4 20 4 20 7" />
+                <line x1="9" y1="20" x2="15" y2="20" />
+                <line x1="12" y1="4" x2="12" y2="20" />
+              </svg>
+              <span className="card__title">Click Words to Seek</span>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                {words.filter(w => w.isFinal).length} words
+              </span>
+            </div>
+            <div style={{ padding: '0.5rem', lineHeight: '2', display: 'flex', flexWrap: 'wrap', gap: '0.25rem' }}>
+              {words.map((word, idx) => {
+                const isActive = word.wid === activeWid;
+                return (
+                  <span
+                    key={word.wid || idx}
+                    onClick={() => seekAndPlay(word.t0)}
+                    className={isActive ? "word word--active" : "word"}
+                    style={{
+                      cursor: word.t0 != null ? 'pointer' : 'default',
+                      padding: '0.2rem 0.4rem',
+                      borderRadius: '4px',
+                      backgroundColor: isActive ? 'rgba(255, 255, 255, 0.25)'
+                        : (word.isFinal ? 'rgba(139, 92, 246, 0.15)' : 'rgba(251, 191, 36, 0.15)'),
+                      border: isActive ? '2px solid rgba(255, 255, 255, 0.5)'
+                        : (word.isFinal ? '1px solid rgba(139, 92, 246, 0.3)' : '1px solid rgba(251, 191, 36, 0.3)'),
+                      color: word.isFinal ? 'var(--text-primary)' : 'var(--text-muted)',
+                      fontSize: '0.8rem',
+                      transition: 'all 0.15s ease',
+                    }}
+                    title={word.t0 != null ? `Seek to ${word.t0.toFixed(2)}s` : 'No timestamp'}
+                  >
+                    {word.text}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ========== RIGHT SIDEBAR - Recording Controls ========== */}
+      <aside className="sidebar sidebar-right">
+        {/* Recording Timer & Buttons */}
+        <div className="sidebar-section">
+          <div className={`recording-timer ${recStatus === "recording" ? "recording-timer--active" : ""}`}>
+            {Math.floor(elapsedMs / 60000)}:{String(Math.floor((elapsedMs % 60000) / 1000)).padStart(2, "0")}
+          </div>
+          <button
+            className={`btn-record ${recStatus === "recording" ? "btn-record--recording" : ""}`}
+            onClick={startRecording}
+            disabled={
+              status !== "connected" ||
+              recStatus === "recording" ||
+              currentSessionStatus === "finalized" ||
+              currentSessionStatus === "stopped"
+            }
+            title={
+              currentSessionStatus === "finalized" || currentSessionStatus === "stopped"
+                ? "Cannot record on a finalized session. Create a new session to record."
+                : undefined
+            }
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" x2="12" y1="19" y2="22" />
+            </svg>
+            {recStatus === "recording" ? "Recording..." : currentSessionStatus === "finalized" || currentSessionStatus === "stopped" ? "Session Finalized" : "Start Recording"}
+          </button>
+          <button
+            className="btn-stop"
+            onClick={stopRecording}
+            disabled={recStatus !== "recording"}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="2" />
+            </svg>
+            Stop Recording
+          </button>
+        </div>
+
+        {/* Microphone Selection */}
+        <div className="sidebar-section">
+          <div className="sidebar-section__title">Microphone</div>
           <select
+            className="mic-select"
             value={selectedMicId}
             onChange={(e) => setSelectedMicId(e.target.value)}
             disabled={recStatus === "recording"}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 6,
-              border: "1px solid rgba(255,255,255,0.2)",
-              background: "var(--surface-primary)",
-              color: "var(--text-primary)",
-              cursor: recStatus === "recording" ? "not-allowed" : "pointer",
-            }}
           >
             {mics.length === 0 && <option value="">No mics found</option>}
             {mics.map((m) => (
               <option key={m.deviceId} value={m.deviceId}>
-                {m.label || `Microphone (${m.deviceId.slice(0, 6)}...)`}
+                {m.label || `Mic (${m.deviceId.slice(0, 8)}...)`}
               </option>
             ))}
           </select>
-        </label>
-        <div style={{
-          fontSize: 14,
-          fontFamily: "monospace",
-          padding: "6px 12px",
-          borderRadius: 6,
-          background: recStatus === "recording" ? "rgba(239,68,68,0.15)" : "var(--surface-primary)",
-          border: recStatus === "recording" ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.1)",
-        }}>
-          {Math.floor(elapsedMs / 60000)}:{String(Math.floor((elapsedMs % 60000) / 1000)).padStart(2, "0")}
         </div>
-      </div>
-
-      {/* Controls */}
-      <div className="controls">
-        <button
-          className={`btn-primary ${recStatus === "recording" ? "btn-recording" : ""}`}
-          onClick={startRecording}
-          disabled={status !== "connected" || recStatus === "recording"}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-            <line x1="12" x2="12" y1="19" y2="22" />
-          </svg>
-          Start Recording
-        </button>
-        <button
-          className="btn-danger"
-          onClick={stopRecording}
-          disabled={recStatus !== "recording"}
-        >
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <rect x="6" y="6" width="12" height="12" rx="2" />
-          </svg>
-          Stop
-        </button>
-      </div>
-
-      {/* Interim Transcript Box (Read-Only) */}
-      <div className="card">
-        <div className="card__header">
-          <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-          <span className="card__title">Interim (Live)</span>
-          {recStatus === "recording" && (
-            <span className="live-indicator">
-              <span className="live-indicator__dot" />
-              Live
-            </span>
-          )}
-        </div>
-        <div className="transcript" style={{ minHeight: 80 }}>
-          {!partialText ? (
-            <p className="transcript__placeholder" style={{ opacity: 0.5, fontStyle: "italic" }}>
-              {recStatus === "recording" ? "Listening..." : "Start recording to see live transcription..."}
-            </p>
-          ) : (
-            <div className="transcript__content">
-              <span className="transcript__partial">{partialText}</span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Final Transcript Box (Rich Text Editor) */}
-      <div className="card">
-        <div className="card__header">
-          <svg className="card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M12 20h9" />
-            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-          </svg>
-          <span className="card__title">Final (Rich Text Editor)</span>
-        </div>
-        <div style={{ padding: "0 1rem 1rem 1rem" }}>
-          <FinalEditor
-            value={finalEditorValue}
-            onChange={(val) => setFinalEditorValue(val)}
-            onUserEdit={() => {
-              setIsFinalDirty(true);
-              isFinalDirtyRef.current = true;
-            }}
-            onResetToLatest={() => {
-              setFinalEditorValue(textToSlateValue(committedFinalText));
-              setIsFinalDirty(false);
-              setHasNewFinalUpdate(false);
-              isFinalDirtyRef.current = false;
-            }}
-            showNewFinalBadge={hasNewFinalUpdate}
-            isFinalDirty={isFinalDirty}
-          />
-          {/* Merge Options Banner */}
-          {newAsrAvailable && (
-            <div style={{
-              marginTop: 12,
-              padding: 12,
-              borderRadius: 8,
-              background: "rgba(16, 185, 129, 0.1)",
-              border: "1px solid rgba(16, 185, 129, 0.3)",
-            }}>
-              <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 8 }}>
-                New ASR update available. Your edits are preserved.
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  onClick={handleAppendAsr}
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: 6,
-                    border: "1px solid rgba(16, 185, 129, 0.4)",
-                    background: "rgba(16, 185, 129, 0.2)",
-                    color: "#10b981",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 500,
-                  }}
-                >
-                  Append new ASR
-                </button>
-                <button
-                  onClick={handleReplaceWithAsr}
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: 6,
-                    border: "1px solid rgba(139, 92, 246, 0.4)",
-                    background: "rgba(139, 92, 246, 0.15)",
-                    color: "var(--text-primary)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 500,
-                  }}
-                >
-                  Replace with ASR
-                </button>
-                <button
-                  onClick={handleIgnoreAsr}
-                  style={{
-                    padding: "6px 14px",
-                    borderRadius: 6,
-                    border: "1px solid rgba(255,255,255,0.2)",
-                    background: "transparent",
-                    color: "var(--text-muted)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                  }}
-                >
-                  Ignore
-                </button>
-              </div>
-              <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)", opacity: 0.8 }}>
-                Latest from ASR: {committedFinalText.slice(0, 80)}{committedFinalText.length > 80 ? "..." : ""}
-              </div>
-            </div>
-          )}
-          {/* Show info when dirty but no new ASR */}
-          {isFinalDirty && !newAsrAvailable && committedFinalText && (
-            <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-muted)", opacity: 0.7 }}>
-              Synced with ASR.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Audio Playback */}
-      {audioUrl && (
-        <div className="card audio-section">
-          <div className="card__header">
-            <svg
-              className="card__icon"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polygon points="5 3 19 12 5 21 5 3" />
-            </svg>
-            <span className="card__title">Playback</span>
-          </div>
-          <div className="audio-player">
-            <audio ref={audioRef} controls src={audioUrl} />
-          </div>
-          <div className="audio-url">{audioUrl}</div>
-        </div>
-      )}
-
-      {/* Clickable Word Spans - Click to seek audio */}
-      {words.length > 0 && (
-        <div className="card">
-          <div className="card__header">
-            <svg
-              className="card__icon"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="4 7 4 4 20 4 20 7" />
-              <line x1="9" y1="20" x2="15" y2="20" />
-              <line x1="12" y1="4" x2="12" y2="20" />
-            </svg>
-            <span className="card__title">Click Words to Seek</span>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: 'auto' }}>
-              {words.filter(w => w.isFinal).length} words
-            </span>
-          </div>
-          <div className="word-spans" style={{
-            padding: '1rem',
-            lineHeight: '2',
-            display: 'flex',
-            flexWrap: 'wrap',
-            gap: '0.25rem'
-          }}>
-            {words.map((word, idx) => {
-              const isActive = word.wid === activeWid;
-              return (
-                <span
-                  key={word.wid || idx}
-                  onClick={() => seekAndPlay(word.t0)}
-                  className={isActive ? "word word--active" : "word"}
-                  style={{
-                    cursor: word.t0 != null ? 'pointer' : 'default',
-                    padding: '0.25rem 0.5rem',
-                    borderRadius: '4px',
-                    backgroundColor: isActive
-                      ? 'rgba(255, 255, 255, 0.25)'
-                      : (word.isFinal
-                        ? 'rgba(139, 92, 246, 0.15)'
-                        : 'rgba(251, 191, 36, 0.15)'),
-                    border: isActive
-                      ? '2px solid rgba(255, 255, 255, 0.5)'
-                      : (word.isFinal
-                        ? '1px solid rgba(139, 92, 246, 0.3)'
-                        : '1px solid rgba(251, 191, 36, 0.3)'),
-                    color: word.isFinal ? 'var(--text-primary)' : 'var(--text-muted)',
-                    fontSize: '0.875rem',
-                    transition: 'all 0.15s ease',
-                    transform: isActive ? 'scale(1.05)' : 'scale(1)',
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isActive) {
-                      e.target.style.backgroundColor = word.isFinal
-                        ? 'rgba(139, 92, 246, 0.3)'
-                        : 'rgba(251, 191, 36, 0.3)';
-                    }
-                    e.target.style.transform = 'translateY(-1px)';
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isActive) {
-                      e.target.style.backgroundColor = word.isFinal
-                        ? 'rgba(139, 92, 246, 0.15)'
-                        : 'rgba(251, 191, 36, 0.15)';
-                    }
-                    e.target.style.transform = isActive ? 'scale(1.05)' : 'scale(1)';
-                  }}
-                  title={word.t0 != null ? `Seek to ${word.t0.toFixed(2)}s` : 'No timestamp'}
-                >
-                  {word.text}
-                </span>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      </aside>
     </div>
   );
 }

@@ -18,15 +18,21 @@ def get_db():
     if _db is not None:
         return _db
 
-    uri = os.getenv("MONGODB_URI")
-    dbname = os.getenv("MONGODB_DB", "realtime_transcription")
+    uri = os.getenv("MONGODB_CONNECTION_STRING")
     if not uri:
+        print("[MONGO] MONGODB_CONNECTION_STRING not set in .env")
         return None
 
+    # Extract database name from URI path (e.g., mongodb+srv://.../.../DB_NAME)
+    from urllib.parse import urlparse
+    parsed = urlparse(uri)
+    dbname = parsed.path.lstrip("/") or "realtime_transcription"
+
     try:
-        _client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        _client = MongoClient(uri, serverSelectionTimeoutMS=10000)
         _client.admin.command("ping")
         _db = _client[dbname]
+        print(f"[MONGO] Connected to cloud database: {dbname}")
 
         if not _indexes_done:
             _db.sessions.create_index([("sessionId", ASCENDING)], unique=True)

@@ -68,8 +68,8 @@ const MarkButton = ({ format, label }) => {
                 padding: "4px 8px",
                 marginRight: 4,
                 borderRadius: 4,
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: isActive ? "rgba(139, 92, 246, 0.3)" : "transparent",
+                border: "1px solid var(--border-default)",
+                background: isActive ? "rgba(139, 92, 246, 0.3)" : "var(--surface-secondary)",
                 color: isActive ? "var(--text-primary)" : "var(--text-muted)",
                 cursor: "pointer",
                 fontWeight: format === "bold" ? "bold" : "normal",
@@ -105,8 +105,8 @@ const HistoryButton = ({ type, editor }) => {
                 padding: "4px 8px",
                 marginRight: 4,
                 borderRadius: 4,
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: "transparent",
+                border: "1px solid var(--border-default)",
+                background: "var(--surface-secondary)",
                 color: "var(--text-muted)",
                 cursor: "pointer",
                 fontSize: 11,
@@ -120,15 +120,15 @@ const HistoryButton = ({ type, editor }) => {
 // ---------------------------
 // Toolbar Component
 // ---------------------------
-const Toolbar = ({ editor, onResetToLatest, showNewFinalBadge, isFinalDirty }) => {
+const Toolbar = ({ editor }) => {
     return (
         <div
             style={{
                 display: "flex",
                 alignItems: "center",
                 padding: "8px 12px",
-                borderBottom: "1px solid rgba(255,255,255,0.1)",
-                background: "rgba(0,0,0,0.15)",
+                borderBottom: "1px solid var(--border-subtle)",
+                background: "var(--surface-secondary)",
                 flexWrap: "wrap",
                 gap: 4,
             }}
@@ -136,44 +136,9 @@ const Toolbar = ({ editor, onResetToLatest, showNewFinalBadge, isFinalDirty }) =
             <MarkButton format="bold" label="B" />
             <MarkButton format="italic" label="I" />
             <MarkButton format="underline" label="U" />
-            <div style={{ width: 1, height: 20, background: "rgba(255,255,255,0.1)", margin: "0 8px" }} />
+            <div style={{ width: 1, height: 20, background: "var(--border-subtle)", margin: "0 8px" }} />
             <HistoryButton type="undo" editor={editor} />
             <HistoryButton type="redo" editor={editor} />
-            <div style={{ flex: 1 }} />
-            {isFinalDirty && (
-                <span style={{ fontSize: 11, color: "var(--color-warning)", marginRight: 8 }}>
-                    Edited
-                </span>
-            )}
-            {showNewFinalBadge && isFinalDirty && (
-                <span style={{
-                    fontSize: 10,
-                    padding: "2px 6px",
-                    borderRadius: 10,
-                    background: "rgba(16, 185, 129, 0.2)",
-                    color: "#10b981",
-                    marginRight: 8,
-                }}>
-                    New update
-                </span>
-            )}
-            <button
-                type="button"
-                onClick={onResetToLatest}
-                disabled={!isFinalDirty && !showNewFinalBadge}
-                style={{
-                    padding: "4px 10px",
-                    fontSize: 11,
-                    borderRadius: 4,
-                    border: "1px solid rgba(255,255,255,0.2)",
-                    background: (isFinalDirty || showNewFinalBadge) ? "rgba(139, 92, 246, 0.2)" : "transparent",
-                    color: (isFinalDirty || showNewFinalBadge) ? "var(--text-primary)" : "var(--text-muted)",
-                    cursor: (isFinalDirty || showNewFinalBadge) ? "pointer" : "not-allowed",
-                    opacity: (isFinalDirty || showNewFinalBadge) ? 1 : 0.5,
-                }}
-            >
-                Use latest
-            </button>
         </div>
     );
 };
@@ -184,32 +149,87 @@ const Toolbar = ({ editor, onResetToLatest, showNewFinalBadge, isFinalDirty }) =
 export default function FinalEditor({
     value,
     onChange,
-    onUserEdit,
-    onResetToLatest,
-    showNewFinalBadge = false,
-    isFinalDirty = false,
 }) {
     const editor = useMemo(() => withHistory(withReact(createEditor())), []);
     const isFirstRender = useRef(true);
     const prevValueRef = useRef(null);
+    const isInternalChangeRef = useRef(false); // Track if change came from user typing
 
-    // Sync editor content when parent value changes (only when NOT dirty)
+    // Sync editor content when parent value changes
+    // This handles loading saved content and appending new ASR text
     useEffect(() => {
-        if (isFirstRender.current) {
-            isFirstRender.current = false;
+        // Skip sync if change came from user editing (internal change)
+        if (isInternalChangeRef.current) {
+            isInternalChangeRef.current = false;
             prevValueRef.current = value;
             return;
         }
-        if (!isFinalDirty && value) {
-            const newText = value[0]?.children?.[0]?.text || "";
-            const prevText = prevValueRef.current?.[0]?.children?.[0]?.text || "";
-            if (newText !== prevText) {
+
+        if (isFirstRender.current) {
+            isFirstRender.current = false;
+            prevValueRef.current = value;
+            // On first render, set editor content directly
+            if (value && Array.isArray(value)) {
                 editor.children = value;
+                editor.selection = null;
+                editor.onChange();
+            }
+            return;
+        }
+
+        if (!value || !Array.isArray(value)) return;
+
+        // Helper to extract plain text from Slate value
+        const getPlainText = (slateValue) => {
+            if (!slateValue || !Array.isArray(slateValue)) return "";
+            return slateValue
+                .map(node => node.children?.map(c => c.text || "").join("") || "")
+                .join("\n");
+        };
+
+        // Compare using full JSON to detect any structural changes
+        const newJson = JSON.stringify(value);
+        const prevJson = JSON.stringify(prevValueRef.current);
+
+        if (newJson !== prevJson) {
+            // Get plain text for smart append logic
+            const newText = getPlainText(value);
+            const currentEditorText = getPlainText(editor.children);
+
+            // If new text is appending to current (ASR update), try smart append
+            if (currentEditorText && newText.startsWith(currentEditorText) && newText.length > currentEditorText.length) {
+                // Calculate delta
+                const delta = newText.slice(currentEditorText.length);
+
+                // Append delta at the end
+                const lastParagraphIndex = editor.children.length - 1;
+                const lastParagraph = editor.children[lastParagraphIndex];
+                if (lastParagraph && lastParagraph.children && lastParagraph.children.length > 0) {
+                    const lastLeafIndex = lastParagraph.children.length - 1;
+                    const lastLeaf = lastParagraph.children[lastLeafIndex];
+                    const offset = lastLeaf?.text?.length || 0;
+
+                    try {
+                        Transforms.insertText(editor, delta, {
+                            at: { path: [lastParagraphIndex, lastLeafIndex], offset: offset }
+                        });
+                    } catch (e) {
+                        // Fallback: replace entire content
+                        console.warn("[FinalEditor] Append failed, replacing content:", e);
+                        editor.children = value;
+                        editor.selection = null;
+                        editor.onChange();
+                    }
+                }
+            } else {
+                // Content changed significantly (e.g. loading from DB) - replace entirely
+                editor.children = value;
+                editor.selection = null;
                 editor.onChange();
             }
         }
         prevValueRef.current = value;
-    }, [value, isFinalDirty, editor]);
+    }, [value, editor]);
 
     const renderLeaf = useCallback((props) => <Leaf {...props} />, []);
     const renderElement = useCallback((props) => <Element {...props} />, []);
@@ -244,30 +264,21 @@ export default function FinalEditor({
 
     return (
         <div style={{
-            border: isFinalDirty ? "2px solid rgba(139, 92, 246, 0.5)" : "1px solid rgba(255,255,255,0.1)",
+            border: "1px solid var(--border-subtle)",
             borderRadius: 8,
-            background: "rgba(0,0,0,0.2)",
+            background: "var(--editor-bg, #ffffff)",
             overflow: "hidden",
         }}>
             <Slate
                 editor={editor}
                 initialValue={value}
                 onChange={(newValue) => {
+                    // Mark this as an internal change so useEffect skips syncing
+                    isInternalChangeRef.current = true;
                     onChange(newValue);
-                    const isUserEdit = editor.operations.some(
-                        op => op.type !== "set_selection" && op.type !== "set_mark"
-                    );
-                    if (isUserEdit && onUserEdit) {
-                        onUserEdit();
-                    }
                 }}
             >
-                <Toolbar
-                    editor={editor}
-                    onResetToLatest={onResetToLatest}
-                    showNewFinalBadge={showNewFinalBadge}
-                    isFinalDirty={isFinalDirty}
-                />
+                <Toolbar editor={editor} />
                 <Editable
                     renderLeaf={renderLeaf}
                     renderElement={renderElement}
