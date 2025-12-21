@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import FinalEditor from "./components/FinalEditor";
+import { BACKEND_URL } from "./services/socket";
 import "./App.css";
 
 export default function App() {
@@ -94,7 +95,7 @@ export default function App() {
   // Socket setup
   // ---------------------------
   useEffect(() => {
-    const socket = io("http://localhost:8000", {
+    const socket = io(BACKEND_URL, {
       // Allow fallback to polling for debugging
       transports: ["websocket", "polling"],
     });
@@ -120,7 +121,7 @@ export default function App() {
         return;
       }
 
-      const url = `http://localhost:8000/sessions/${data.sessionId}/audio`;
+      const url = `${BACKEND_URL}/sessions/${data.sessionId}/audio`;
       setAudioUrl(url);
       log(`recording saved size=${data.size}`);
     });
@@ -157,7 +158,7 @@ export default function App() {
 
       // Auto-refresh session list after finalization (with small delay for DB write)
       setTimeout(() => {
-        fetch("http://localhost:8000/sessions")
+        fetch(`${BACKEND_URL}/sessions`)
           .then((r) => r.json())
           .then((list) => setSavedSessions(list || []))
           .catch(() => { });
@@ -303,7 +304,7 @@ export default function App() {
   // Fetch saved sessions from MongoDB
   const fetchSessions = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/sessions");
+      const res = await fetch(`${BACKEND_URL}/api/sessions`);
       const data = await res.json();
       setSavedSessions(data.sessions || []);
       log(`Fetched ${data.sessions?.length || 0} sessions`);
@@ -317,7 +318,7 @@ export default function App() {
     if (!sid) return;
     setLoadingSession(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/sessions/${sid}`);
+      const res = await fetch(`${BACKEND_URL}/api/sessions/${sid}`);
       const data = await res.json();
       if (data.session) {
         // Save to localStorage for next app open
@@ -327,7 +328,7 @@ export default function App() {
         setIsNewSession(false);
         setCurrentSessionStatus(data.session.status || "finalized"); // Set status from loaded session
 
-        setAudioUrl(`http://localhost:8000/sessions/${sid}/audio`);
+        setAudioUrl(`${BACKEND_URL}/sessions/${sid}/audio`);
         setFinalText(data.finalText || data.session.finalText || "");
         setCommittedFinalText(data.finalText || data.session.finalText || "");
 
@@ -429,7 +430,7 @@ export default function App() {
       if (durationMs !== null) {
         body.durationMs = durationMs;
       }
-      await fetch(`http://localhost:8000/api/sessions/${sessionId}/content`, {
+      await fetch(`${BACKEND_URL}/api/sessions/${sessionId}/content`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -661,7 +662,7 @@ export default function App() {
       await saveSlateContent(recordingDurationMs);
       // Refresh session list to show the newly saved session
       try {
-        const res = await fetch("http://localhost:8000/api/sessions");
+        const res = await fetch(`${BACKEND_URL}/api/sessions`);
         const data = await res.json();
         setSavedSessions(data.sessions || []);
       } catch (err) {

@@ -3,7 +3,8 @@
  */
 import { io } from "socket.io-client";
 
-const BACKEND_URL = "http://localhost:8000";
+// Use environment variable for backend URL, fallback to localhost for development
+const BACKEND_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 /**
  * Create a new Socket.IO connection to the backend.
@@ -15,4 +16,6 @@ export function createSocket() {
     });
 }
 
+export { BACKEND_URL };
 export default createSocket;
+

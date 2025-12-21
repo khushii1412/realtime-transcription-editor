@@ -13,10 +13,11 @@ from flask_cors import CORS
 # Import route and handler registrations
 from api.routes import register_routes
 from ws.handlers import register_socket_handlers
+from config import PORT, SECRET_KEY
 
 # Create Flask app
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "dev-secret"
+app.config["SECRET_KEY"] = SECRET_KEY
 
 # Enable CORS for all routes (allows frontend to fetch from different port)
 CORS(app)
@@ -30,4 +31,5 @@ register_socket_handlers(socketio)
 
 # Main entry point
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=8000, debug=True, use_reloader=False)
+    socketio.run(app, host="0.0.0.0", port=PORT, debug=True, use_reloader=False)
+

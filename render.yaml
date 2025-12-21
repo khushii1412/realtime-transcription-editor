@@ -1,0 +1,43 @@
+# Render Blueprint Configuration
+# https://render.com/docs/blueprint-spec
+
+services:
+  # Backend - Flask/SocketIO Web Service
+  - type: web
+    name: transcription-backend
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class eventlet -w 1 app:app
+    rootDir: backend
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: MONGODB_CONNECTION_STRING
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+    healthCheckPath: /health
+
+  # Frontend - Vite Static Site
+  - type: web
+    name: transcription-frontend
+    runtime: static
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    rootDir: frontend
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: transcription-backend
+          property: host
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
